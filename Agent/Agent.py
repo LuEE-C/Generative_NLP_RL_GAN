@@ -34,7 +34,7 @@ def proximal_policy_optimization_loss(actual_value,  old_prediction):
 
 
 class Agent:
-    def __init__(self, training_epochs=10, sigma_init=0.02, LSTM_n=100, cutoff=4):
+    def __init__(self, training_epochs=10, sigma_init=0.02, LSTM_n=100, cutoff=4, gamma = 0.9):
         self.training_epochs = training_epochs
         self.cutoff = cutoff
         self.environnement = Environnement(cutoff=cutoff)
@@ -48,6 +48,8 @@ class Agent:
 
         self.actor = self._build_actor(sigma_init=sigma_init, LSTM_n=LSTM_n)
         self.critic = self._build_critic(LSTM_n=LSTM_n)
+
+        self.gamma = gamma
 
     def _build_actor(self, sigma_init, LSTM_n):
 
@@ -97,35 +99,43 @@ class Agent:
             while done == False:
 
                 real_batch, done = self.environnement.query_state(batch_size=batch_size)
-                fake_batch = self.get_fake_batch(batch_size=batch_size)
+                fake_batch, actions, old_prediction = self.get_fake_batch(batch_size=batch_size)
 
+                values = self.get_values(batch_size=batch_size, fake_batch=fake_batch)
                 batch = np.append(real_batch, fake_batch)
                 labels = np.append(np.ones((batch_size,)),np.zeros((batch_size,)))
 
-                #todo value calculation to train the actor, this almost works.
-
-                # for _ in range(self.training_epochs):
-                #     self.actor.train_on_batch([real_state, v, value_predictions, old_prediction], [a])
-                # for _ in range(self.training_epochs):
-                #     self.critic.train_on_batch([real_state], [v])
+                for _ in range(self.training_epochs):
+                    self.actor.train_on_batch([fake_batch, values, old_prediction], [actions])
+                for _ in range(self.training_epochs):
+                    self.critic.train_on_batch([batch], [labels])
                 self.actor.get_layer('next_word').sample_noise()
 
     @numba.jit
     def get_fake_batch(self, batch_size):
 
         fake_batch = np.zeros((batch_size, self.cutoff))
-        for i in range(batch_size//self.cutoff):
+        actions = np.zeros((batch_size, self.vocab))
+        predictions = np.zeros((batch_size, self.vocab))
+        for i in range(batch_size // self.cutoff):
             fake_state = fake_batch[i]
             for j in range(self.cutoff):
                 fake_pred = self.actor.predict([fake_state, self.dummy_value, self.dummy_prediction])
+                actions[i + j][np.argmax(fake_pred)] = 1
+                predictions[i + j] = fake_pred
                 fake_state[j] = np.argmax(fake_pred)
                 fake_batch[i + j] = fake_state
-        return fake_batch
+        return fake_batch, actions, predictions
 
 
+    @numba.jit
+    def get_values(self, batch_size, fake_batch):
 
-
-
+        values = self.critic.predict(fake_batch)
+        for i in range(batch_size // self.cutoff):
+            for j in range(self.cutoff - 1, 1, -1):
+                values[i + j - 1] += values[i + j] * self.gamma
+        return values
 
 
 if __name__ == '__main__':
