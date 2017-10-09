@@ -1,40 +1,35 @@
-from Environnement.Environnement import Environnement
-from Agent.NoisyDense import NoisyDense
-from Agent.LSTM_Model import LSTM_Model
-from Agent.DenseNet import DenseNet
-
-import os
-import pickle
-import numpy as np
-import numba
 import math
+import os
 
 import keras.backend as K
-from keras.layers import Input, Dense, Embedding
+import numba
+import numpy as np
+from keras.layers import Input, Dense, Embedding, Dropout, BatchNormalization, Activation
 from keras.models import Model
 
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+from Environnement.Environnement import Environnement
+from LSTM_Model import LSTM_Model
 
-def normal_log_density(x, policy):
-    var = K.pow(K.std(policy), 2)
-    log_density = -K.pow(x - K.mean(policy), 2) / (2 * var) - 0.5 * K.log(2 * math.pi) - K.log(K.std(policy))
-    return K.sum(log_density)
 
-def proximal_policy_optimization_loss(actual_value,  old_prediction):
+# os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
+def policy_loss(actual_value, predicted_value, old_prediction):
     # Fucky advantage, really just reward but it will be self correcting like GAN's are hopefully
-    advantage = actual_value
+    advantage = actual_value - predicted_value + 1e-10
     def loss(y_true, y_pred):
-        prob = normal_log_density(y_pred, y_true)
-        old_prob = normal_log_density(y_pred, old_prediction)
+        prob = K.sum(y_pred * y_true, axis=1, keepdims=True) + 1e-10
+        old_prob = K.sum(old_prediction * y_true, axis=1, keepdims=True) + 1e-10
+        log_prob = K.log(prob) + 1e-10
 
-        r = prob/old_prob
+        r = prob / old_prob
 
-        return K.mean(K.minimum(r * advantage, K.clip(r, min_value=0.8, max_value=1.2) * advantage))
+        entropy = K.sum(y_pred * K.log(y_pred), axis=1, keepdims=True)
+        return -log_prob * K.mean(K.minimum(r * advantage, K.clip(r, min_value=0.8, max_value=1.2) * advantage)) + 0.001 * entropy
     return loss
 
 
 class Agent:
-    def __init__(self, training_epochs=10, sigma_init=0.02, LSTM_n=100, cutoff=4, gamma = 0.9):
+    def __init__(self, training_epochs=10, LSTM_n=100, cutoff=4, from_save=False, gamma=.95):
         self.training_epochs = training_epochs
         self.cutoff = cutoff
         self.environnement = Environnement(cutoff=cutoff)
@@ -42,103 +37,169 @@ class Agent:
 
         self.training_data = [[], [], [], []]
         self.dummy_value = np.zeros((1, 1))
-        self.dummy_prediction = np.zeros((1, self.vocab))
+        self.dummy_predictions = np.zeros((1, self.vocab))
 
         self.values, self.amount_of_trades, self.val_values, self.val_amount_of_trades = [], [], [], []
 
-        self.actor = self._build_actor(sigma_init=sigma_init, LSTM_n=LSTM_n)
-        self.critic = self._build_critic(LSTM_n=LSTM_n)
+        self.actor, self.discriminator = self._build_shared_embedding_actor_critic_and_discriminator(LSTM_n=LSTM_n)
 
-        self.gamma = gamma
+        self.gammas = [gamma ** (i + 1) for i in range(self.cutoff)]
 
-    def _build_actor(self, sigma_init, LSTM_n):
+        if from_save is True:
+            self.actor.load_weights('actor')
+            self.discriminator.load_weights('discriminator')
 
-        state_input = Input(shape=(self.cutoff))
+    def _build_shared_embedding_actor_critic_and_discriminator(self, LSTM_n):
+
+        actor_state_input = Input(shape=(self.cutoff,))
+        discriminator_state_input = Input(shape=(self.cutoff,))
+
+        # Used for loss function
         actual_value = Input(shape=(1,))
-        old_prediction = Input(shape=(self.vocab,))
-        x = Embedding(self.vocab, 60, input_length=self.cutoff)(state_input)
-        #x = DenseNet(state_input, 5, 4, 16, 20, dropout_rate=0.5)
-        x = LSTM_Model(x, LSTM_n)
+        predicted_value = Input(shape=(1,))
+        old_predictions = Input(shape=(self.vocab,))
 
-        next_word = NoisyDense(self.vocab, activation='softmax', sigma_init=sigma_init, name='next_word')(x)
+        shared_embedding = Embedding(self.vocab + 1, 50, input_length=self.cutoff)
 
-        model = Model(inputs=[state_input, actual_value, old_prediction], outputs=[next_word])
-        model.compile(optimizer='adam',
-                      loss=[proximal_policy_optimization_loss(
-                          actual_value=actual_value,
-                          old_prediction=old_prediction)])
+        actor = shared_embedding(actor_state_input)
+        discriminator = shared_embedding(discriminator_state_input)
 
-        model.get_layer('next_word').sample_noise()
-        model.summary()
-        return model
+        actor = LSTM_Model(actor, LSTM_n)
+        actor = Dense(256)(actor)
+        actor = Dropout(0.5)(actor)
+        actor = BatchNormalization()(actor)
+        # ReLu is bad with softmax
+        actor = Activation('tanh')(actor)
+        discriminator = LSTM_Model(discriminator, LSTM_n)
 
-    def _build_critic(self, LSTM_n):
+        actor_next_word = Dense(self.vocab, activation='softmax')(actor)
+        critic_value = Dense(1)(actor)
+        discriminator_verdict = Dense(1, activation='sigmoid')(discriminator)
 
-        state_input = Input(shape=(self.cutoff,))
-        x = Embedding(self.vocab, 60, input_length=self.cutoff)(state_input)
-        #x = DenseNet(state_input, 5, 4, 16, 20, dropout_rate=0.5)
-        x = LSTM_Model(x, LSTM_n)
+        actor_model = Model(inputs=[actor_state_input, actual_value, predicted_value, old_predictions], outputs=[actor_next_word, critic_value])
+        actor_model.compile(optimizer='adam',
+                      loss=[policy_loss(actual_value=actual_value,
+                                        predicted_value=predicted_value,
+                                        old_prediction=old_predictions),
+                            'mse'])
 
-        out_value = Dense(1, activation='sigmoid')(x)
+        discriminator_model = Model(inputs=discriminator_state_input, outputs=discriminator_verdict)
+        discriminator_model.compile(optimizer='adam', loss='binary_crossentropy')
 
-        model = Model(inputs=[state_input], outputs=[out_value])
-        model.compile(optimizer='adam', loss=['binary_crossentropy'])
-        return model
+        actor_model.summary()
+
+        return actor_model, discriminator_model
+
 
     def train(self, epoch, batch_size=32):
-
-        #fixing batch_size so we don't have odd data and such, iunno if it will change anything but it can't hurt
-        if batch_size % self.cutoff != 0:
-            batch_size += (self.cutoff - batch_size % self.cutoff)
-
-        e = -1
+        value_list = []
+        e = 0
         while e <= epoch:
             done = False
-            e += 1
             print('Epoch :', e)
+            batch_num = 0
+            skiped = 0
             while done == False:
 
-                real_batch, done = self.environnement.query_state(batch_size=batch_size)
-                fake_batch, actions, old_prediction = self.get_fake_batch(batch_size=batch_size)
-
+                fake_batch, actions, predicted_values, old_predictions = self.get_fake_batch(batch_size=batch_size)
                 values = self.get_values(batch_size=batch_size, fake_batch=fake_batch)
-                batch = np.append(real_batch, fake_batch)
-                labels = np.append(np.ones((batch_size,)),np.zeros((batch_size,)))
+                value_list.append(np.mean(values))
+                for _ in range(10):
+                    print(self.actor.train_on_batch([fake_batch, values, predicted_values, old_predictions], [actions, values]))
 
-                for _ in range(self.training_epochs):
-                    self.actor.train_on_batch([fake_batch, values, old_prediction], [actions])
-                for _ in range(self.training_epochs):
-                    self.critic.train_on_batch([batch], [labels])
-                self.actor.get_layer('next_word').sample_noise()
+                ## Need to penalize critic somehow, maybe implement wassertein afterall?
+                ## maybe just train it when gen caught up to it
+                if np.mean(value_list[-100:]) > -0.25:
+                    real_batch, done = self.environnement.query_state(batch_size=batch_size)
+                    batch = np.vstack((real_batch, fake_batch))
+                    labels = np.array([1] * batch_size + [0] * batch_size)
+                    self.discriminator.train_on_batch([batch], [labels])
+                else:
+                    skiped += 1
 
+                if batch_num % 500 == 0:
+                    print('skiped', skiped)
+                    skiped = 0
+                    self.actor.save_weights('actor')
+                    self.discriminator.save_weights('discriminator')
+                    print('Batch number :', batch_num, '  Epoch :', e, '  Average values :', np.mean(value_list[-100:]))
+                    self.print_pred()
+                batch_num += 1
+            e += 1
+
+    @numba.jit
+    def make_seed(self):
+        # This is the kinda Z vector
+        seed = np.random.random_integers(low=0, high=self.vocab - 1, size=(1, self.cutoff))
+        for _ in range(self.cutoff):
+            seed[:,:-1] = seed[:,1:]
+            predictions = self.actor.predict([seed, self.dummy_value, self.dummy_value, self.dummy_predictions])
+
+            # Numerical stability stuff
+            np.nan_to_num(predictions[0][0], copy=False)
+            if np.sum(predictions[0][0]) < 0.9:
+                print('It broke')
+            predictions[0][0] += 1e-10
+
+            # If sum is 1.01 we divide everything by 1.01
+            predictions[0][0] /= np.sum(predictions[0][0])
+
+            seed[:,-1] = np.random.choice(self.vocab, 1, p=predictions[0][0])
+        return seed
+
+    # If this is to slow I can make multiple batches at the same time
     @numba.jit
     def get_fake_batch(self, batch_size):
 
+        seed = self.make_seed()
         fake_batch = np.zeros((batch_size, self.cutoff))
+        predicted_values = np.zeros((batch_size, 1))
         actions = np.zeros((batch_size, self.vocab))
-        predictions = np.zeros((batch_size, self.vocab))
-        for i in range(batch_size // self.cutoff):
-            fake_state = fake_batch[i]
-            for j in range(self.cutoff):
-                fake_pred = self.actor.predict([fake_state, self.dummy_value, self.dummy_prediction])
-                actions[i + j][np.argmax(fake_pred)] = 1
-                predictions[i + j] = fake_pred
-                fake_state[j] = np.argmax(fake_pred)
-                fake_batch[i + j] = fake_state
-        return fake_batch, actions, predictions
+        old_predictions = np.zeros((batch_size, self.vocab))
+        for i in range(batch_size):
+            predictions = self.actor.predict([seed, self.dummy_value, self.dummy_value, self.dummy_predictions])
+
+            np.nan_to_num(predictions[0][0], copy=False)
+            if np.sum(predictions[0][0]) < 0.9:
+                print('It broke')
+            predictions[0][0] += 1e-10
+            predictions[0][0] /= np.sum(predictions[0][0])
+
+            old_predictions[i] = predictions[0][0]
+
+            choice = np.random.choice(self.vocab, 1, p=predictions[0][0])
+            predicted_values[i][0] = predictions[1][0]
+            actions[i][choice] = 1
+            seed[:,:-1] = seed[:,1:]
+            seed[:,-1] = choice
+            fake_batch[i] = seed
+
+        return fake_batch, actions, predicted_values, old_predictions
 
 
+    # Optimise this 2
     @numba.jit
     def get_values(self, batch_size, fake_batch):
+        # Sigmoid output, we 0 center it by substracting 0.5
+        values = self.discriminator.predict(fake_batch) - 0.5
 
-        values = self.critic.predict(fake_batch)
-        for i in range(batch_size // self.cutoff):
-            for j in range(self.cutoff - 1, 1, -1):
-                values[i + j - 1] += values[i + j] * self.gamma
+        # N_Step reward function
+        for i in range(batch_size):
+            for j in range(min(self.cutoff, batch_size - i - self.cutoff - 1)):
+                values[i] += values[i + j + 1] * self.gammas[j]
         return values
 
+    @numba.jit
+    def print_pred(self):
+        fake_state = self.make_seed()
+        print(fake_state)
+        pred = ""
+        for j in range(self.cutoff):
+            pred += self.environnement.ind_to_word[fake_state[0][j]]
+            pred += " "
+        print(pred)
 
 if __name__ == '__main__':
-
-    agent = Agent(LSTM_n=50, cutoff=4)
-    agent.train(epoch=5000, batch_size=64)
+    agent = Agent(LSTM_n=100, cutoff=8, from_save=False)
+    # Small batch size makes all the diff, gotta get sum of that stochastic noise
+    agent.train(epoch=5000, batch_size=128)

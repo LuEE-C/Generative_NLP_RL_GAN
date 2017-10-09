@@ -1,4 +1,4 @@
-from keras.layers import Dropout, GRU
+from keras.layers import Dropout, GRU, Bidirectional, Activation
 from keras import layers
 from keras.layers.normalization import BatchNormalization
 from keras.layers.advanced_activations import PReLU
@@ -17,7 +17,7 @@ def LSTM_Model(input_tensor, gru_cells):
     z = layers.add([x, y])
     z = GRU(gru_cells, recurrent_dropout=0.5)(z)
     z = BatchNormalization()(z)
-    z = PReLU()(z)
+    z = Activation('tanh')(z)
 
     return z
 
