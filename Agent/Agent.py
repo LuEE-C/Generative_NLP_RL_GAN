@@ -4,27 +4,26 @@ import os
 import keras.backend as K
 import numba
 import numpy as np
-from keras.layers import Input, Dense, Embedding, Dropout, BatchNormalization, Activation
+from keras.layers import Input, Dense, Embedding, Dropout, BatchNormalization, PReLU
 from keras.models import Model
 
 from Environnement.Environnement import Environnement
 from LSTM_Model import LSTM_Model
 
 
-# os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 def policy_loss(actual_value, predicted_value, old_prediction):
-    # Fucky advantage, really just reward but it will be self correcting like GAN's are hopefully
     advantage = actual_value - predicted_value + 1e-10
     def loss(y_true, y_pred):
         prob = K.sum(y_pred * y_true, axis=1, keepdims=True) + 1e-10
         old_prob = K.sum(old_prediction * y_true, axis=1, keepdims=True) + 1e-10
-        log_prob = K.log(prob) + 1e-10
+        log_prob = K.log(prob) - 1e-10
 
-        r = prob / old_prob
+        r = prob / old_prob + 1e-10
 
-        entropy = K.sum(y_pred * K.log(y_pred), axis=1, keepdims=True)
-        return -log_prob * K.mean(K.minimum(r * advantage, K.clip(r, min_value=0.8, max_value=1.2) * advantage)) + 0.001 * entropy
+        entropy = K.sum(y_pred * K.log(y_pred), axis=1, keepdims=True) - 1e-10
+        return -log_prob * K.mean(K.minimum(r * advantage, K.clip(r, min_value=0.8, max_value=1.2) * advantage)) + 1 * entropy
     return loss
 
 
@@ -65,11 +64,9 @@ class Agent:
         discriminator = shared_embedding(discriminator_state_input)
 
         actor = LSTM_Model(actor, LSTM_n)
-        actor = Dense(256)(actor)
-        actor = Dropout(0.5)(actor)
-        actor = BatchNormalization()(actor)
+        actor = Dense(256, activation='tanh')(actor)
         # ReLu is bad with softmax
-        actor = Activation('tanh')(actor)
+        actor = BatchNormalization()(actor)
         discriminator = LSTM_Model(discriminator, LSTM_n)
 
         actor_next_word = Dense(self.vocab, activation='softmax')(actor)
@@ -98,32 +95,33 @@ class Agent:
             done = False
             print('Epoch :', e)
             batch_num = 0
-            skiped = 0
             while done == False:
 
                 fake_batch, actions, predicted_values, old_predictions = self.get_fake_batch(batch_size=batch_size)
                 values = self.get_values(batch_size=batch_size, fake_batch=fake_batch)
+                fake_batch = fake_batch[:batch_size]
                 value_list.append(np.mean(values))
+
+                # print('batch', fake_batch)
+                # print('old preds', old_predictions)
                 for _ in range(10):
-                    print(self.actor.train_on_batch([fake_batch, values, predicted_values, old_predictions], [actions, values]))
+                    self.actor.train_on_batch([fake_batch, values, predicted_values, old_predictions], [actions, values])
 
                 ## Need to penalize critic somehow, maybe implement wassertein afterall?
                 ## maybe just train it when gen caught up to it
-                if np.mean(value_list[-100:]) > -0.25:
-                    real_batch, done = self.environnement.query_state(batch_size=batch_size)
-                    batch = np.vstack((real_batch, fake_batch))
-                    labels = np.array([1] * batch_size + [0] * batch_size)
-                    self.discriminator.train_on_batch([batch], [labels])
-                else:
-                    skiped += 1
+                # if np.mean(value_list[-100:]) > -0.25:
+                real_batch, done = self.environnement.query_state(batch_size=batch_size)
+                batch = np.vstack((real_batch, fake_batch))
+                labels = np.array([1] * batch_size + [0] * batch_size)
+                self.discriminator.train_on_batch([batch], [labels])
+
 
                 if batch_num % 500 == 0:
-                    print('skiped', skiped)
-                    skiped = 0
                     self.actor.save_weights('actor')
                     self.discriminator.save_weights('discriminator')
                     print('Batch number :', batch_num, '  Epoch :', e, '  Average values :', np.mean(value_list[-100:]))
                     self.print_pred()
+
                 batch_num += 1
             e += 1
 
@@ -152,16 +150,14 @@ class Agent:
     def get_fake_batch(self, batch_size):
 
         seed = self.make_seed()
-        fake_batch = np.zeros((batch_size, self.cutoff))
-        predicted_values = np.zeros((batch_size, 1))
-        actions = np.zeros((batch_size, self.vocab))
-        old_predictions = np.zeros((batch_size, self.vocab))
-        for i in range(batch_size):
+        fake_batch = np.zeros((batch_size + self.cutoff, self.cutoff))
+        predicted_values = np.zeros((batch_size + self.cutoff, 1))
+        actions = np.zeros((batch_size + self.cutoff, self.vocab))
+        old_predictions = np.zeros((batch_size + self.cutoff, self.vocab))
+        for i in range(batch_size + self.cutoff):
             predictions = self.actor.predict([seed, self.dummy_value, self.dummy_value, self.dummy_predictions])
 
             np.nan_to_num(predictions[0][0], copy=False)
-            if np.sum(predictions[0][0]) < 0.9:
-                print('It broke')
             predictions[0][0] += 1e-10
             predictions[0][0] /= np.sum(predictions[0][0])
 
@@ -174,7 +170,7 @@ class Agent:
             seed[:,-1] = choice
             fake_batch[i] = seed
 
-        return fake_batch, actions, predicted_values, old_predictions
+        return fake_batch, actions[:batch_size], predicted_values[:batch_size], old_predictions[:batch_size]
 
 
     # Optimise this 2
@@ -187,12 +183,11 @@ class Agent:
         for i in range(batch_size):
             for j in range(min(self.cutoff, batch_size - i - self.cutoff - 1)):
                 values[i] += values[i + j + 1] * self.gammas[j]
-        return values
+        return values[:batch_size]
 
     @numba.jit
     def print_pred(self):
         fake_state = self.make_seed()
-        print(fake_state)
         pred = ""
         for j in range(self.cutoff):
             pred += self.environnement.ind_to_word[fake_state[0][j]]
@@ -200,6 +195,6 @@ class Agent:
         print(pred)
 
 if __name__ == '__main__':
-    agent = Agent(LSTM_n=100, cutoff=8, from_save=False)
+    agent = Agent(LSTM_n=75, cutoff=8, from_save=False)
     # Small batch size makes all the diff, gotta get sum of that stochastic noise
     agent.train(epoch=5000, batch_size=128)

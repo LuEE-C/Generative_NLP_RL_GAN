@@ -6,18 +6,16 @@ from keras.layers.advanced_activations import PReLU
 
 def LSTM_Model(input_tensor, gru_cells):
     model_input = input_tensor
-    x = GRU(gru_cells, return_sequences=True, recurrent_dropout=0.5)(model_input)
-    x = BatchNormalization()(x)
+    x = Bidirectional(GRU(gru_cells, recurrent_dropout=0.5, return_sequences=True))(model_input)
     x = PReLU()(x)
 
-    y = GRU(gru_cells, return_sequences=True, recurrent_dropout=0.5)(x)
-    y = BatchNormalization()(y)
+    y = Bidirectional(GRU(gru_cells, recurrent_dropout=0.5, return_sequences=True))(x)
     y = PReLU()(y)
 
     z = layers.add([x, y])
-    z = GRU(gru_cells, recurrent_dropout=0.5)(z)
+    z = Bidirectional(GRU(gru_cells, recurrent_dropout=0.5))(z)
+    z = PReLU()(z)
     z = BatchNormalization()(z)
-    z = Activation('tanh')(z)
 
     return z
 
