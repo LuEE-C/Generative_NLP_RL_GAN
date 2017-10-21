@@ -14,15 +14,15 @@ from LSTM_Model import LSTM_Model
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 def policy_loss(actual_value, predicted_value, old_prediction):
-    advantage = actual_value - predicted_value + 1e-10
+    advantage = actual_value - predicted_value
     def loss(y_true, y_pred):
-        prob = K.sum(y_pred * y_true, axis=1, keepdims=True) + 1e-10
-        old_prob = K.sum(old_prediction * y_true, axis=1, keepdims=True) + 1e-10
-        log_prob = K.log(prob) - 1e-10
+        prob = K.sum(y_pred * y_true, axis=1, keepdims=True)
+        old_prob = K.sum(old_prediction * y_true, axis=1, keepdims=True)
+        log_prob = K.log(prob + 1e-10)
 
-        r = prob / old_prob + 1e-10
+        r = prob / old_prob
 
-        entropy = K.sum(y_pred * K.log(y_pred), axis=1, keepdims=True) - 1e-10
+        entropy = K.sum(y_pred * K.log(y_pred + 1e-10), axis=1, keepdims=True)
         return -log_prob * K.mean(K.minimum(r * advantage, K.clip(r, min_value=0.8, max_value=1.2) * advantage)) + 1 * entropy
     return loss
 
