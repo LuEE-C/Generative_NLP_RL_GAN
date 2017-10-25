@@ -1,12 +1,11 @@
 import numpy as np
-import pandas as pd
 import numba
 from Environnement import data_util
 
 class Environnement:
-    def __init__(self, cutoff=4):
-        self.ind_to_word, self.datas = data_util.convert_text_to_nptensor(cutoff=cutoff)
-        self.different_words = len(self.ind_to_word) + 1
+    def __init__(self, cutoff=4, min_frequency_words=75000):
+        self.ind_to_word, self.datas = data_util.convert_text_to_nptensor(cutoff=cutoff, min_frequency_words=min_frequency_words)
+        self.different_words = len(self.ind_to_word)
         self.index = 0
 
     @numba.jit

@@ -125,6 +125,6 @@ def DenseNet(input_tensor, nb_layers, nb_dense_block, growth_rate,
                            beta_regularizer=l2(weight_decay))(x)
     x = PReLU()(x)
     # Skiped Global average pooling, more interesting to feed found patterns to lstm
-    # x = GlobalAveragePooling1D()(x)
+    x = GlobalAveragePooling1D()(x)
 
     return x

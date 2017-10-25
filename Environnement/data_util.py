@@ -6,10 +6,10 @@ import pickle
 
 # This does two passes through the data, the first one to figure out what are the characters
 # or words that interest us, getting rid of those that are not present enough
-def convert_text_to_nptensor(directory='../datas/BillionWords/', cutoff=5, min_frequency_words=25000, max_lines=17000000, name='Billion_Words'):
-    if os.path.isfile('../datas/TransformedData/' + 'text_' + name + str(cutoff) + '.npy'):
-        X = np.load('../datas/TransformedData/' +  'text_' + name + str(cutoff) + '.npy')
-        ind_to_word = pickle.load(open('../datas/TransformedData/' + 'ind_to_word_Billion_Words.pickle', 'rb'))
+def convert_text_to_nptensor(directory='../datas/BillionWords/', cutoff=5, min_frequency_words=50000, max_lines=50000000, name='Billion_Words'):
+    if os.path.isfile('../datas/TransformedData/' + 'text_' + name + str(cutoff) + '_' + str(min_frequency_words) + '.npy'):
+        X = np.load('../datas/TransformedData/' +  'text_' + name + str(cutoff) + '_' + str(min_frequency_words) + '.npy')
+        ind_to_word = pickle.load(open('../datas/TransformedData/' + 'ind_to_word_' + name + str(cutoff) + '_' + str(min_frequency_words) + '.pickle', 'rb'))
     else:
         words = Counter()
         n_lines = 0
@@ -75,10 +75,10 @@ def convert_text_to_nptensor(directory='../datas/BillionWords/', cutoff=5, min_f
                         offset += cutoff
                         lines_added += 1
         print(lines_added)
-        with open('../datas/TransformedData/ind_to_word_' + name + '.pickle', 'wb') as pck:
+        with open('../datas/TransformedData/ind_to_word_' + name + str(cutoff) + '_' + str(min_frequency_words) + '.pickle', 'wb') as pck:
             pickle.dump(ind_to_word, pck)
-        np.save('../datas/TransformedData/text_' + name + str(cutoff), X)
+        np.save('../datas/TransformedData/text_' + name + str(cutoff) + '_' + str(min_frequency_words), X[:lines_added])
     return ind_to_word, X
 
 if __name__ == '__main__':
-    convert_text_to_nptensor(cutoff=8, min_frequency_words=25000)
+    convert_text_to_nptensor(cutoff=8, min_frequency_words=75000)

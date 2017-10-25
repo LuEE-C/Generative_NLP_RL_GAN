@@ -90,3 +90,24 @@ class NoisyDense(Layer):
     def remove_noise(self):
         self.epsilon_kernel = K.zeros(shape=(self.input_dim, self.units))
         self.epsilon_bias = K.zeros(shape=(self.units,))
+
+    def get_config(self):
+        config = {
+            'units': self.units,
+            'sigma_init': self.sigma_init,
+            'sigma_kernel': self.sigma_kernel,
+            'sigma_bias': self.sigma_bias,
+            'epsilon_bias': self.epsilon_bias,
+            'epsilon_kernel': self.epsilon_kernel,
+            'activation': activations.serialize(self.activation),
+            'use_bias': self.use_bias,
+            'kernel_initializer': initializers.serialize(self.kernel_initializer),
+            'bias_initializer': initializers.serialize(self.bias_initializer),
+            'kernel_regularizer': regularizers.serialize(self.kernel_regularizer),
+            'bias_regularizer': regularizers.serialize(self.bias_regularizer),
+            'activity_regularizer': regularizers.serialize(self.activity_regularizer),
+            'kernel_constraint': constraints.serialize(self.kernel_constraint),
+            'bias_constraint': constraints.serialize(self.bias_constraint)
+        }
+        base_config = super(NoisyDense, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
