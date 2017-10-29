@@ -8,13 +8,17 @@ from keras.layers import Input, Dense, Embedding, PReLU, BatchNormalization, Con
 from keras.models import Model
 
 from Environnement.Environnement import Environnement
-from DenseNet import DenseNet
 from LSTM_Model import LSTM_Model
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
 def policy_loss(actual_value, predicted_value, old_prediction, mask):
     advantage = actual_value - predicted_value
+
+    # Maybe some halfbaked normalization would be nice
+    # something like advantage = advantage + 0.1 * advantage/(K.std(advantage) + 1e-10)
+
+    # Fullbaked norm seems very unstable
     # advantage /= (K.std(advantage) + 1e-10)
     def loss(y_true, y_pred):
         prob = K.sum(y_pred * y_true, axis=-1)
@@ -77,7 +81,6 @@ class Agent:
         if from_save is True:
             self.actor_critic_discriminator.load_weights('actor_critic_discriminator')
 
-    # Just compile two-three models with shared layers wtf is that shit, i need sleep
     def _build_actor_critic_discriminator(self):
 
         state_input = Input(shape=(self.cutoff,))
@@ -107,7 +110,6 @@ class Agent:
 
 
         main_network = LSTM_Model(main_network, 75)
-        # This 1 needs some help
         actor_critic = Dense(128)(main_network)
         actor_critic = PReLU()(actor_critic)
         actor_critic = BatchNormalization()(actor_critic)
@@ -157,7 +159,7 @@ class Agent:
                     tmp_loss[i] = (self.actor_critic_discriminator.train_on_batch([fake_batch, values, predicted_values, old_predictions, self.batch_one_mask, self.batch_zero_mask], [actions, values, self.batch_zero_mask])[1:-1])
                 policy_losses.append(np.mean(tmp_loss[:,0]))
                 critic_losses.append(np.mean(tmp_loss[:,1]))
-                # Set mask to value of thing? Like
+
                 real_batch, done = self.environnement.query_state(self.batch_size)
                 batch = np.vstack((real_batch, fake_batch))
                 discrim_losses.append(self.actor_critic_discriminator.train_on_batch([batch, self.double_batch_dummy_value,
@@ -261,7 +263,6 @@ def numba_optimised_pred_rollover(old_predictions, predictions, vocab, index, se
     seed[:, :-1] = seed[:, 1:]
     seed[:, -1] = choice
     fake_batch[index] = seed
-
 
 @nb.jit(nb.void(nb.float32[:,:], nb.int64, nb.float32[:,:]))
 def numba_optimised_seed_switch(predictions, vocab, seed):
