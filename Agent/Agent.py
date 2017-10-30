@@ -12,7 +12,7 @@ from LSTM_Model import LSTM_Model
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-def policy_loss(actual_value, predicted_value, old_prediction, mask):
+def policy_loss(actual_value, predicted_value, old_prediction):
     advantage = actual_value - predicted_value
 
     # Maybe some halfbaked normalization would be nice
@@ -28,22 +28,12 @@ def policy_loss(actual_value, predicted_value, old_prediction, mask):
         r = prob / (old_prob + 1e-10)
 
         entropy = K.sum(y_pred * K.log(y_pred + 1e-10), axis=-1)
-        return mask * (-log_prob * K.mean(K.minimum(r * advantage, K.clip(r, min_value=0.8, max_value=1.2) * advantage)) + 0.05 * entropy)
-    return loss
-
-def discriminator_loss(mask):
-    def loss(y_true, y_pred):
-        return mask * losses.binary_crossentropy(y_true, y_pred)
-    return loss
-
-def critic_loss(mask):
-    def loss(y_true, y_pred):
-        return mask * losses.mean_squared_error(y_true, y_pred)
+        return -log_prob * K.mean(K.minimum(r * advantage, K.clip(r, min_value=0.8, max_value=1.2) * advantage)) + 0.01 * entropy
     return loss
 
 
 class Agent:
-    def __init__(self, training_epochs=10, cutoff=4, from_save=False, gamma=.9, batch_size=126):
+    def __init__(self, training_epochs=10, cutoff=4, from_save=False, gamma=.9, batch_size=126, different_seeds=5):
         self.training_epochs = training_epochs
         self.cutoff = cutoff
         self.environnement = Environnement(cutoff=cutoff)
@@ -51,6 +41,7 @@ class Agent:
 
         self.training_data = [[], [], [], []]
         self.batch_size = batch_size
+        self.different_seeds = different_seeds
 
         # Bunch of placeholders values
         self.dummy_value = np.zeros((1, 1))
@@ -74,12 +65,13 @@ class Agent:
 
         self.labels = np.array([1] * self.batch_size + [0] * self.batch_size)
 
-        self.actor_critic_discriminator = self._build_actor_critic_discriminator()
+        self.actor_critic, self.discriminator = self._build_actor_critic_discriminator()
 
         self.gammas = np.array([gamma ** (i + 1) for i in range(self.cutoff)]).astype(np.float32)
 
         if from_save is True:
-            self.actor_critic_discriminator.load_weights('actor_critic_discriminator')
+            self.actor_critic.load_weights('actor_critic')
+            self.discriminator.load_weights('discriminator')
 
     def _build_actor_critic_discriminator(self):
 
@@ -89,8 +81,6 @@ class Agent:
         actual_value = Input(shape=(1,))
         predicted_value = Input(shape=(1,))
         old_predictions = Input(shape=(self.vocab,))
-        policy_mask = Input(shape=(1,))
-        discriminator_mask = Input(shape=(1,))
 
         embedding = Embedding(self.vocab + 1, 50, input_length=self.cutoff)(state_input)
 
@@ -108,7 +98,6 @@ class Agent:
         main_network = PReLU()(main_network)
         main_network = BatchNormalization()(main_network)
 
-
         main_network = LSTM_Model(main_network, 75)
         actor_critic = Dense(128)(main_network)
         actor_critic = PReLU()(actor_critic)
@@ -122,21 +111,21 @@ class Agent:
         critic_value = Dense(1)(actor_critic)
         discriminator_verdict = Dense(1, activation='sigmoid')(discriminator)
 
-        actor_critic_discriminator = Model(inputs=[state_input, actual_value, predicted_value, old_predictions, policy_mask, discriminator_mask], outputs=[actor_next_word, critic_value, discriminator_verdict])
-        actor_critic_discriminator.compile(optimizer='adam',
+        actor_critic = Model(inputs=[state_input, actual_value, predicted_value, old_predictions], outputs=[actor_next_word, critic_value])
+        actor_critic.compile(optimizer='adam',
                       loss=[policy_loss(actual_value=actual_value,
                                         predicted_value=predicted_value,
-                                        old_prediction=old_predictions,
-                                        mask=policy_mask
+                                        old_prediction=old_predictions
                                         ),
-                            critic_loss(mask=policy_mask),
-                            discriminator_loss(mask=discriminator_mask)
+                            'mse'
                             ])
 
-        actor_critic_discriminator.summary()
+        discriminator = Model(inputs=[state_input],
+                             outputs=[discriminator_verdict])
+        discriminator.compile(optimizer='adam',
+                             loss=['binary_crossentropy'])
 
-        return actor_critic_discriminator
-
+        return actor_critic, discriminator
 
     def train(self, epoch):
 
@@ -156,25 +145,20 @@ class Agent:
 
                 tmp_loss = np.zeros(shape=(10, 2))
                 for i in range(10):
-                    tmp_loss[i] = (self.actor_critic_discriminator.train_on_batch([fake_batch, values, predicted_values, old_predictions, self.batch_one_mask, self.batch_zero_mask], [actions, values, self.batch_zero_mask])[1:-1])
+                    tmp_loss[i] = (self.actor_critic.train_on_batch([fake_batch, values, predicted_values, old_predictions],
+                                                                    [actions, values])[1:])
                 policy_losses.append(np.mean(tmp_loss[:,0]))
                 critic_losses.append(np.mean(tmp_loss[:,1]))
 
                 real_batch, done = self.environnement.query_state(self.batch_size)
                 batch = np.vstack((real_batch, fake_batch))
-                discrim_losses.append(self.actor_critic_discriminator.train_on_batch([batch, self.double_batch_dummy_value,
-                                                                      self.double_batch_dummy_value,
-                                                                      self.double_batch_dummy_predictions,
-                                                                      self.double_batch_zero_mask,
-                                                                      self.double_batch_one_mask],
-                                                                     [self.double_batch_dummy_predictions,
-                                                                      self.double_batch_dummy_value,
-                                                                      self.labels])[-1])
+                discrim_losses.append(self.discriminator.train_on_batch([batch], [self.labels])[-1])
 
 
                 if batch_num % 500 == 0:
                     print()
-                    self.actor_critic_discriminator.save_weights('actor_critic_discriminator')
+                    self.actor_critic.save_weights('actor_critic')
+                    self.discriminator.save_weights('discriminator')
                     print('Batch number :', batch_num, '\tEpoch :', e, '\tAverage values :', np.mean(value_list))
                     print('Policy losses :', '%.5f' % np.mean(policy_losses),
                           '\tCritic losses :', '%.5f' % np.mean(critic_losses),
@@ -186,16 +170,20 @@ class Agent:
             e += 1
 
     @nb.jit
-    def make_seed(self):
-        # This is the kinda Z vector
-        seed = np.random.random_integers(low=0, high=self.vocab - 1, size=(1, self.cutoff))
+    def make_seed(self, different_seeds=None):
+        if different_seeds is None:
+            different_seeds = self.different_seeds
 
-        predictions = self.actor_critic_discriminator.predict(
-            [seed, self.dummy_value, self.dummy_value, self.dummy_predictions, self.zero_mask, self.zero_mask])[0]
+
+        # This is the kinda Z vector
+        seed = np.random.random_integers(low=0, high=self.vocab - 1, size=(different_seeds, self.cutoff))
+
+        predictions = self.actor_critic.predict(
+            [seed, self.dummy_value, self.dummy_value, self.dummy_predictions])[0]
         for _ in range(self.cutoff - 1):
             numba_optimised_seed_switch(predictions[0], self.vocab, seed)
-            predictions = self.actor_critic_discriminator.predict(
-                [seed, self.dummy_value, self.dummy_value, self.dummy_predictions, self.zero_mask, self.zero_mask])[0]
+            predictions = self.actor_critic.predict(
+                [seed, self.dummy_value, self.dummy_value, self.dummy_predictions])[0]
         numba_optimised_seed_switch(predictions[0], self.vocab, seed)
 
         return seed
@@ -209,7 +197,7 @@ class Agent:
         actions = np.zeros((self.batch_size + self.cutoff, self.vocab))
         old_predictions = np.zeros((self.batch_size + self.cutoff, self.vocab))
         for i in range(self.batch_size + self.cutoff):
-            predictions = self.actor_critic_discriminator.predict([seed, self.dummy_value, self.dummy_value, self.dummy_predictions, self.zero_mask, self.zero_mask])
+            predictions = self.actor_critic.predict([seed, self.dummy_value, self.dummy_value, self.dummy_predictions])
             numba_optimised_pred_rollover(old_predictions, predictions, self.vocab, i, seed, predicted_values, actions, fake_batch)
 
         return fake_batch, actions[:self.batch_size], predicted_values[:self.batch_size], old_predictions[:self.batch_size]
@@ -217,11 +205,7 @@ class Agent:
     @nb.jit
     def get_values(self, fake_batch):
         # Subtract 0.5 for better understanding of values
-        values = self.actor_critic_discriminator.predict([fake_batch, self.batch_cutoff_dummy_value,
-                                                          self.batch_cutoff_dummy_value,
-                                                          self.batch_cutoff_dummy_predictions,
-                                                          self.batch_cutoff_zero_mask,
-                                                          self.batch_cutoff_zero_mask])[2] - .5
+        values = self.discriminator.predict([fake_batch])[-1] - .5
 
         return numba_optimised_nstep_value_function(values, self.batch_size, self.cutoff, self.gammas)
 
