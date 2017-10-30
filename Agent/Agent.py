@@ -127,8 +127,8 @@ class Agent:
                 value_list.append(np.mean(values))
 
 
-                tmp_loss = np.zeros(shape=(10, 2))
-                for i in range(10):
+                tmp_loss = np.zeros(shape=(self.training_epochs, 2))
+                for i in range(self.training_epochs):
                     tmp_loss[i] = (self.actor_critic.train_on_batch([fake_batch, values, predicted_values, old_predictions],
                                                                     [actions, values])[1:])
                 policy_losses.append(np.mean(tmp_loss[:,0]))
