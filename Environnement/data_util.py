@@ -80,5 +80,7 @@ def convert_text_to_nptensor(directory='../datas/BillionWords/', cutoff=5, min_f
         np.save('../datas/TransformedData/text_' + name + str(cutoff) + '_' + str(min_frequency_words), X[:lines_added])
     return ind_to_word, X
 
+
+
 if __name__ == '__main__':
-    convert_text_to_nptensor(cutoff=8, min_frequency_words=75000)
+    convert_text_to_nptensor(cutoff=8, min_frequency_words=30000)

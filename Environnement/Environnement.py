@@ -3,7 +3,7 @@ import numba
 from Environnement import data_util
 
 class Environnement:
-    def __init__(self, cutoff=4, min_frequency_words=75000):
+    def __init__(self, cutoff=4, min_frequency_words=30000):
         self.ind_to_word, self.datas = data_util.convert_text_to_nptensor(cutoff=cutoff, min_frequency_words=min_frequency_words)
         self.different_words = len(self.ind_to_word)
         self.index = 0
