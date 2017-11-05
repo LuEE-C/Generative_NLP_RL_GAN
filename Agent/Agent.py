@@ -33,7 +33,7 @@ def policy_loss(actual_value, predicted_value, old_prediction):
 
 
 class Agent:
-    def __init__(self, training_epochs=10, cutoff=4, from_save=False, gamma=.9, batch_size=126, different_seeds=5):
+    def __init__(self, training_epochs=10, cutoff=4, from_save=False, gamma=.9, batch_size=126):
         self.training_epochs = training_epochs
         self.cutoff = cutoff
         self.environnement = Environnement(cutoff=cutoff)
@@ -41,7 +41,6 @@ class Agent:
 
         self.training_data = [[], [], [], []]
         self.batch_size = batch_size
-        self.different_seeds = different_seeds
 
         # Bunch of placeholders values
         self.dummy_value = np.zeros((1, 1))
@@ -154,13 +153,11 @@ class Agent:
             e += 1
 
     @nb.jit
-    def make_seed(self, different_seeds=None):
-        if different_seeds is None:
-            different_seeds = self.different_seeds
+    def make_seed(self):
 
 
         # This is the kinda Z vector
-        seed = np.random.random_integers(low=0, high=self.vocab - 1, size=(different_seeds, self.cutoff))
+        seed = np.random.random_integers(low=0, high=self.vocab - 1, size=(1, self.cutoff))
 
         predictions = self.actor_critic.predict(
             [seed, self.dummy_value, self.dummy_value, self.dummy_predictions])[0]
