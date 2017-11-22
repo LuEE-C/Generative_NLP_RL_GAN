@@ -59,16 +59,16 @@ class NoisyDense(Layer):
         else:
             self.bias = None
             self.epsilon_bias = None
-        self.sample_noise()
+        # self.sample_noise()
         super(NoisyDense, self).build(input_shape)
 
 
     def call(self, X):
-        perturbation = self.sigma_kernel * self.epsilon_kernel
+        perturbation = self.sigma_kernel * K.random_normal(shape=(self.input_dim, self.units), mean=0, stddev=1)
         perturbed_kernel = self.kernel + perturbation
         output = K.dot(X, perturbed_kernel)
         if self.use_bias:
-            bias_perturbation = self.sigma_bias * self.epsilon_bias
+            bias_perturbation = self.sigma_bias * K.random_normal(shape=(self.units,), mean=0, stddev=1)
             perturbed_bias = self.bias + bias_perturbation
             output = K.bias_add(output, perturbed_bias)
         if self.activation is not None:
@@ -82,14 +82,9 @@ class NoisyDense(Layer):
         output_shape[-1] = self.units
         return tuple(output_shape)
 
-    def sample_noise(self):
-
-        self.epsilon_kernel = K.random_normal(shape=(self.input_dim, self.units), mean=0, stddev=1)
-        self.epsilon_bias = K.random_normal(shape=(self.units,), mean=0, stddev=1)
-
     def remove_noise(self):
-        self.epsilon_kernel = K.zeros(shape=(self.input_dim, self.units))
-        self.epsilon_bias = K.zeros(shape=(self.units,))
+        self.sigma_kernel = K.zeros(shape=(self.input_dim, self.units))
+        self.sigma_bias = K.zeros(shape=(self.units,))
 
     def get_config(self):
         config = {
@@ -97,8 +92,8 @@ class NoisyDense(Layer):
             'sigma_init': self.sigma_init,
             'sigma_kernel': self.sigma_kernel,
             'sigma_bias': self.sigma_bias,
-            'epsilon_bias': self.epsilon_bias,
-            'epsilon_kernel': self.epsilon_kernel,
+            # 'epsilon_bias': self.epsilon_bias,
+            # 'epsilon_kernel': self.epsilon_kernel,
             'activation': activations.serialize(self.activation),
             'use_bias': self.use_bias,
             'kernel_initializer': initializers.serialize(self.kernel_initializer),

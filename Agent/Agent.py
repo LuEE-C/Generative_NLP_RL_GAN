@@ -1,190 +1,213 @@
 import os
 
-import keras.backend as K
-from keras import losses
 import numba as nb
 import numpy as np
-from keras.layers import Input, Dense, Embedding, PReLU, BatchNormalization, Conv1D, UpSampling1D
+import math
+from random import random, randint
+
+from keras.optimizers import Adam
+from keras.layers import Input, Dense, Embedding, PReLU, BatchNormalization, Conv1D
 from keras.models import Model
 
 from Environnement.Environnement import Environnement
 from LSTM_Model import LSTM_Model
+from NoisyDense import NoisyDense
+from PriorityExperienceReplay.PriorityExperienceReplay import Experience
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-def policy_loss(actual_value, predicted_value, old_prediction):
-    advantage = actual_value - predicted_value
-
-    # Maybe some halfbaked normalization would be nice
-    # something like advantage = advantage + 0.1 * advantage/(K.std(advantage) + 1e-10)
-
-    # Fullbaked norm seems very unstable
-    # advantage /= (K.std(advantage) + 1e-10)
-    def loss(y_true, y_pred):
-        prob = K.sum(y_pred * y_true, axis=-1)
-        old_prob = K.sum(old_prediction * y_true, axis=-1)
-        log_prob = K.log(prob + 1e-10)
-
-        r = prob / (old_prob + 1e-10)
-
-        entropy = K.sum(y_pred * K.log(y_pred + 1e-10), axis=-1)
-        return -log_prob * K.mean(K.minimum(r * advantage, K.clip(r, min_value=0.8, max_value=1.2) * advantage)) + 0.01 * entropy
-    return loss
-
 
 class Agent:
-    def __init__(self, training_epochs=10, cutoff=4, from_save=False, gamma=.9, batch_size=126, different_seeds=5):
-        self.training_epochs = training_epochs
+    def __init__(self, cutoff=8, from_save=False, gamma=.9, batch_size=32, min_history=64000, lr=0.0000625,
+                 sigma_init=0.5, target_network_period=32000, adam_e=1.5*10e-4, atoms=51,
+                 discriminator_loss_limits=0.1, n_steps=3):
         self.cutoff = cutoff
-        self.environnement = Environnement(cutoff=cutoff)
+        self.environnement = Environnement(cutoff=cutoff, min_frequency_words=300000)
         self.vocab = self.environnement.different_words
 
-        self.training_data = [[], [], [], []]
         self.batch_size = batch_size
-        self.different_seeds = different_seeds
-
-        # Bunch of placeholders values
-        self.dummy_value = np.zeros((1, 1))
-        self.dummy_predictions = np.zeros((1, self.vocab))
-        self.one_mask = np.ones((1, 1))
-        self.zero_mask = np.zeros((1, 1))
-
-        self.batch_one_mask = np.ones((self.batch_size, 1))
-        self.batch_zero_mask = np.zeros((self.batch_size, 1))
-
-        self.batch_cutoff_dummy_value = np.zeros((self.batch_size+ self.cutoff, 1))
-        self.batch_cutoff_dummy_predictions = np.zeros((self.batch_size+ self.cutoff, self.vocab))
-        self.batch_cutoff_one_mask = np.ones((self.batch_size + self.cutoff, 1))
-        self.batch_cutoff_zero_mask = np.zeros((self.batch_size + self.cutoff, 1))
-
-        self.double_batch_dummy_value = np.zeros((self.batch_size * 2, 1))
-        self.double_batch_dummy_predictions = np.zeros((self.batch_size * 2, self.vocab))
-        self.double_batch_one_mask = np.ones((self.batch_size * 2, 1))
-        self.double_batch_zero_mask = np.zeros((self.batch_size * 2, 1))
-
+        self.n_steps = n_steps
 
         self.labels = np.array([1] * self.batch_size + [0] * self.batch_size)
+        self.gammas = np.array([gamma ** (i + 1) for i in range(self.n_steps + 1)]).astype(np.float32)
 
-        self.actor_critic, self.discriminator = self._build_actor_critic_discriminator()
+        self.atoms = atoms
+        self.v_max = np.sum([0.5 * gam for gam in self.gammas])
+        self.v_min = - self.v_max
+        self.delta_z = (self.v_max - self.v_min) / float(self.atoms - 1)
+        self.z_steps = np.array([self.v_min + i * self.delta_z for i in range(self.atoms)]).astype(np.float32)
 
-        self.gammas = np.array([gamma ** (i + 1) for i in range(self.cutoff)]).astype(np.float32)
+        self.epsilon_greedy_max = 0.8
+        self.sigma_init = sigma_init
 
+        self.min_history = min_history
+        self.lr = lr
+        self.target_network_period = target_network_period
+        self.adam_e = adam_e
+
+        self.discriminator_loss_limit = discriminator_loss_limits
+
+        self.model, self.target_model = self._build_model(), self._build_model()
+        self.discriminator = self._build_discriminator()
+
+        self.dataset_epoch = 0
         if from_save is True:
-            self.actor_critic.load_weights('actor_critic')
+            self.model.load_weights('model')
+            self.target_model.load_weights('model')
             self.discriminator.load_weights('discriminator')
 
-    def _build_actor_critic_discriminator(self):
+    def update_target_model(self):
+        self.target_model.set_weights(self.model.get_weights())
+
+    def get_average_noisy_weight(self):
+        average = []
+        for i in range(self.vocab):
+            average.append(np.mean(self.model.get_layer('Word_'+str(i)).get_weights()[1]))
+
+        return np.mean(average), np.std(average)
+
+    def _build_model(self):
 
         state_input = Input(shape=(self.cutoff,))
 
-        # Used for loss function
-        actual_value = Input(shape=(1,))
-        predicted_value = Input(shape=(1,))
-        old_predictions = Input(shape=(self.vocab,))
+        embedding = Embedding(self.vocab + 1, 50, input_length=self.cutoff)(state_input)
+
+        main_network = Conv1D(256, 3, padding='same')(embedding)
+        main_network = PReLU()(main_network)
+
+        main_network = LSTM_Model(main_network, 100, batch_norm=False)
+
+        main_network = Dense(256)(main_network)
+        main_network = PReLU()(main_network)
+
+        main_network = Dense(512)(main_network)
+        main_network = PReLU()(main_network)
+
+        dist_list = []
+
+        for i in range(self.vocab):
+            dist_list.append(NoisyDense(self.atoms, activation='softmax', sigma_init=self.sigma_init, name='Word_' + str(i))(main_network))
+
+
+        actor = Model(inputs=[state_input], outputs=dist_list)
+        actor.compile(optimizer=Adam(lr=self.lr, epsilon=self.adam_e),
+                      loss='categorical_crossentropy')
+
+        return actor
+
+    def _build_discriminator(self):
+
+        state_input = Input(shape=(self.cutoff,))
 
         embedding = Embedding(self.vocab + 1, 50, input_length=self.cutoff)(state_input)
 
         main_network = Conv1D(256, 3, padding='same')(embedding)
         main_network = PReLU()(main_network)
         main_network = BatchNormalization()(main_network)
-        main_network = UpSampling1D()(main_network)
 
-        main_network = Conv1D(128, 5, padding='same')(main_network)
-        main_network = PReLU()(main_network)
-        main_network = BatchNormalization()(main_network)
-        main_network = UpSampling1D()(main_network)
+        main_network = LSTM_Model(main_network, 100)
 
-        main_network = Conv1D(64, 7, padding='same')(main_network)
+        main_network = Dense(256)(main_network)
         main_network = PReLU()(main_network)
         main_network = BatchNormalization()(main_network)
 
-        main_network = LSTM_Model(main_network, 75)
-        actor_critic = Dense(128)(main_network)
-        actor_critic = PReLU()(actor_critic)
-        actor_critic = BatchNormalization()(actor_critic)
+        main_network = Dense(512)(main_network)
+        main_network = PReLU()(main_network)
+        main_network = BatchNormalization()(main_network)
 
-        discriminator = Dense(128)(main_network)
-        discriminator = PReLU()(discriminator)
-        discriminator = BatchNormalization()(discriminator)
+        discriminator_output = Dense(1, activation='sigmoid')(main_network)
 
-        actor_next_word = Dense(self.vocab, activation='softmax')(actor_critic)
-        critic_value = Dense(1)(actor_critic)
-        discriminator_verdict = Dense(1, activation='sigmoid')(discriminator)
 
-        actor_critic = Model(inputs=[state_input, actual_value, predicted_value, old_predictions], outputs=[actor_next_word, critic_value])
-        actor_critic.compile(optimizer='adam',
-                      loss=[policy_loss(actual_value=actual_value,
-                                        predicted_value=predicted_value,
-                                        old_prediction=old_predictions
-                                        ),
-                            'mse'
-                            ])
+        discriminator = Model(inputs=[state_input], outputs=discriminator_output)
+        discriminator.compile(optimizer=Adam(),
+                      loss='binary_crossentropy')
 
-        discriminator = Model(inputs=[state_input],
-                             outputs=[discriminator_verdict])
-        discriminator.compile(optimizer='adam',
-                             loss=['binary_crossentropy'])
+        discriminator.summary()
 
-        return actor_critic, discriminator
+        return discriminator
 
     def train(self, epoch):
 
-        value_list, discrim_losses, policy_losses, critic_losses = [], [], [], []
-        e = 0
+        e, total_frames = 0, 0
         while e <= epoch:
-            done = False
             print('Epoch :', e)
-            batch_num = 0
-            while done == False:
 
-                fake_batch, actions, predicted_values, old_predictions = self.get_fake_batch()
-                values = self.get_values(fake_batch)
-                fake_batch = fake_batch[:self.batch_size]
-                value_list.append(np.mean(values))
+            discrim_loss, model_loss_array, memory = [1], [], Experience(memory_size=1000000, batch_size=self.batch_size, alpha=0.5)
+            while np.mean(discrim_loss[-20:]) >= self.discriminator_loss_limit:
+                discrim_loss.append(self.train_discriminator())
 
+            for i in range(self.min_history//200):
+                states, rewards, actions, states_prime = self.get_training_batch(200, self.get_epsilon(np.mean(discrim_loss[-20:])))
+                for j in range(200):
+                    memory.add((states[j], rewards[j], actions[j], states_prime[j]), 5)
 
-                tmp_loss = np.zeros(shape=(10, 2))
-                for i in range(10):
-                    tmp_loss[i] = (self.actor_critic.train_on_batch([fake_batch, values, predicted_values, old_predictions],
-                                                                    [actions, values])[1:])
-                policy_losses.append(np.mean(tmp_loss[:,0]))
-                critic_losses.append(np.mean(tmp_loss[:,1]))
+            trained_frames = 1
+            while np.mean(discrim_loss[-20:]) < 0.5 + 0.5 * 500000/(trained_frames * 10 * 4 * self.batch_size):
 
-                real_batch, done = self.environnement.query_state(self.batch_size)
-                batch = np.vstack((real_batch, fake_batch))
-                discrim_losses.append(self.discriminator.train_on_batch([batch], [self.labels])[-1])
+                if trained_frames % (self.target_network_period//(10 * 4 * self.batch_size)) == 0:
+                    self.update_target_model()
 
+                states, rewards, actions, states_prime = self.get_training_batch(10 * self.batch_size, self.get_epsilon(np.mean(discrim_loss[-20:])))
+                for j in range(10 * self.batch_size):
+                    memory.add((states[j], rewards[j], actions[j], states_prime[j]), 5)
 
-                if batch_num % 500 == 0:
+                for j in range(10 * 4):
+                    out, weights, indices = memory.select(min(1, 0.4 + 1.2 * np.mean(discrim_loss[-20:]))) # Scales b value
+                    model_loss_array.append(self.train_on_replay(out, self.batch_size)[0])
+                    memory.priority_update(indices, [model_loss_array[-1] for _ in range(self.batch_size)])
+
+                trained_frames += 1
+                total_frames += 1
+                discrim_loss.append(self.train_discriminator(evaluate=True))
+
+                if trained_frames % 100 == 0:
                     print()
-                    self.actor_critic.save_weights('actor_critic')
-                    self.discriminator.save_weights('discriminator')
-                    print('Batch number :', batch_num, '\tEpoch :', e, '\tAverage values :', np.mean(value_list))
-                    print('Policy losses :', '%.5f' % np.mean(policy_losses),
-                          '\tCritic losses :', '%.5f' % np.mean(critic_losses),
-                          '\tDiscriminator losses :', '%.5f' % np.mean(discrim_losses))
-                    self.print_pred()
-                    value_list, discrim_losses, policy_losses, critic_losses = [], [], [], []
+                    mean, std = self.get_average_noisy_weight()
+                    print('Average loss of model :', np.mean(model_loss_array[-10 * 4 * 20:]),
+                          '\tAverage discriminator loss :', np.mean(discrim_loss[-20:]),
+                          '\tFrames passed :', trained_frames * 10 * 4 * self.batch_size,
+                          '\tTotal frames passed :', total_frames * 10 * 4 * self.batch_size,
+                          '\tAverage Noisy Weights :', mean,
+                          '\tSTD Noisy Weights :', std,
+                          '\tEpoch :', e,
+                          '\tDataset Epoch :', self.dataset_epoch
+                          )
 
-                batch_num += 1
+                    self.print_pred()
+                    self.print_pred()
+
+            self.update_target_model()
+
             e += 1
 
+    def get_epsilon(self, discrim_loss):
+        epsilon = min(1.0, (0.1 / discrim_loss)) * self.epsilon_greedy_max
+        return epsilon
+
     @nb.jit
-    def make_seed(self, different_seeds=None):
-        if different_seeds is None:
-            different_seeds = self.different_seeds
+    def train_discriminator(self, evaluate=False):
+        fake_batch = self.get_fake_batch()
+        real_batch, done = self.environnement.query_state(self.batch_size)
+        if done is True:
+            self.dataset_epoch += 1
+            print('Current Dataset Epoch :', self.dataset_epoch)
+        batch = np.vstack((real_batch, fake_batch))
+        if evaluate is True:
+            return self.discriminator.evaluate([batch], [self.labels], verbose=0)
+        return self.discriminator.train_on_batch([batch], [self.labels])
 
+    @nb.jit
+    def make_seed(self, seed=None):
 
-        # This is the kinda Z vector
-        seed = np.random.random_integers(low=0, high=self.vocab - 1, size=(different_seeds, self.cutoff))
+        if seed is None:
+            # This is the kinda Z vector
+            seed = np.random.random_integers(low=0, high=self.vocab - 1, size=(1, self.cutoff))
 
-        predictions = self.actor_critic.predict(
-            [seed, self.dummy_value, self.dummy_value, self.dummy_predictions])[0]
+        predictions = self.target_model.predict(seed)
         for _ in range(self.cutoff - 1):
-            numba_optimised_seed_switch(predictions[0], self.vocab, seed)
-            predictions = self.actor_critic.predict(
-                [seed, self.dummy_value, self.dummy_value, self.dummy_predictions])[0]
-        numba_optimised_seed_switch(predictions[0], self.vocab, seed)
+            numba_optimised_seed_switch(predictions, seed, self.z_steps)
+            predictions = self.target_model.predict(seed)
+        numba_optimised_seed_switch(predictions, seed, self.z_steps)
 
         return seed
 
@@ -192,68 +215,139 @@ class Agent:
     def get_fake_batch(self):
 
         seed = self.make_seed()
-        fake_batch = np.zeros((self.batch_size + self.cutoff, self.cutoff))
-        predicted_values = np.zeros((self.batch_size + self.cutoff, 1))
-        actions = np.zeros((self.batch_size + self.cutoff, self.vocab))
-        old_predictions = np.zeros((self.batch_size + self.cutoff, self.vocab))
-        for i in range(self.batch_size + self.cutoff):
-            predictions = self.actor_critic.predict([seed, self.dummy_value, self.dummy_value, self.dummy_predictions])
-            numba_optimised_pred_rollover(old_predictions, predictions, self.vocab, i, seed, predicted_values, actions, fake_batch)
+        fake_batch = np.zeros((self.batch_size, self.cutoff))
+        for i in range(self.batch_size):
+            predictions = self.target_model.predict([seed])
+            numba_optimised_pred_rollover(predictions, i, seed, fake_batch, self.z_steps)
 
-        return fake_batch, actions[:self.batch_size], predicted_values[:self.batch_size], old_predictions[:self.batch_size]
+        return fake_batch
+
+    @nb.jit
+    def get_training_batch(self, batch_size, epsilon):
+        seed = self.make_seed()
+        states = np.zeros((batch_size + self.n_steps, self.cutoff))
+        actions = np.zeros((batch_size + self.n_steps, 1))
+        for i in range(batch_size + self.n_steps):
+            action = -1
+            predictions = self.target_model.predict(seed)
+            if random() < epsilon:
+                action = randint(0, self.vocab - 1)
+
+            numba_optimised_pred_rollover_with_actions(predictions, i, seed, states, self.z_steps, actions, action)
+
+        rewards = self.get_values(states)
+        states_prime = states[self.n_steps:]
+
+        return states[:-self.n_steps], rewards, actions, states_prime
 
     @nb.jit
     def get_values(self, fake_batch):
-        # Subtract 0.5 for better understanding of values
-        values = self.discriminator.predict([fake_batch])[-1] - .5
-
-        return numba_optimised_nstep_value_function(values, self.batch_size, self.cutoff, self.gammas)
+        values = self.discriminator.predict(fake_batch)
+        return numba_optimised_nstep_value_function(values, values.shape[0], self.n_steps, self.gammas)
 
     @nb.jit
     def print_pred(self):
         fake_state = self.make_seed()
 
         pred = ""
+        for _ in range(4):
+            for j in range(self.cutoff):
+                pred += self.environnement.ind_to_word[fake_state[0][j]]
+                pred += " "
+            fake_state = self.make_seed(fake_state)
         for j in range(self.cutoff):
             pred += self.environnement.ind_to_word[fake_state[0][j]]
             pred += " "
         print(pred)
 
-        fake_state = self.make_seed()
-        pred = ""
-        for j in range(self.cutoff):
-            pred += self.environnement.ind_to_word[fake_state[0][j]]
-            pred += " "
-        print(pred)
+
+
+    # @nb.jit
+    def train_on_replay(self, data, batch_size):
+        states, reward, actions, state_prime = make_dataset(data=data, batch_size=batch_size)
+
+        m_prob = np.zeros((batch_size, self.vocab, self.atoms))
+
+        z = self.target_model.predict(state_prime)
+        z = np.array(z)
+        z = np.swapaxes(z, 0, 1)
+        q = np.sum(np.multiply(z, self.z_steps), axis=-1)
+        optimal_action_idxs = np.argmax(q, axis=-1)
+
+        update_m_prob(self.batch_size, self.atoms, self.v_max, self.v_min, reward, self.gammas[-1],
+                      self.z_steps, self.delta_z, m_prob, actions, z, optimal_action_idxs)
+
+        return self.model.train_on_batch(states, [m_prob[:,i,:] for i in range(self.vocab)])
+
+
+@nb.jit(nb.void(nb.int64,nb.int64,nb.float32,nb.float32, nb.float32[:],nb.float32,
+                nb.float32[:],nb.float32,nb.float32[:,:,:],nb.float32[:,:], nb.float32[:,:,:], nb.float32[:]))
+def update_m_prob(batch_size, atoms, v_max, v_min, reward, gamma, z_steps, delta_z, m_prob, actions, z, optimal_action_idxs):
+    for i in range(batch_size):
+        for j in range(atoms):
+            Tz = min(v_max, max(v_min, reward[i] + gamma * z_steps[j]))
+            bj = (Tz - v_min) / delta_z
+            m_l, m_u = math.floor(bj), math.ceil(bj)
+            m_prob[i, actions[i, 0], int(m_l)] += z[i, optimal_action_idxs[i], j] * (m_u - bj)
+            m_prob[i, actions[i, 0], int(m_l)] += z[i, optimal_action_idxs[i], j] * (bj - m_l)
+
+# @nb.jit
+def make_dataset(data, batch_size):
+    states, reward, actions, state_prime = [], [], [], []
+    for i in range(batch_size):
+        states.append(data[i][0])
+        reward.append(data[i][1])
+        actions.append(data[i][2])
+        state_prime.append(data[i][3])
+    states = np.array(states)
+    reward = np.array(reward)
+    actions = np.array(actions).astype(np.int)
+    state_prime = np.array(state_prime)
+    return states, reward, actions, state_prime
+
+@nb.jit(nb.int64(nb.float32[:,:], nb.float32[:]))
+def get_optimal_action(z, z_distrib):
+
+    z_concat = np.vstack(z)
+    q = np.sum(np.multiply(z_concat, z_distrib), axis=1)
+    action_idx = np.argmax(q)
+
+    return action_idx
 
 
 # Some strong numba optimisation in bottlenecks
 # N_Step reward function
 @nb.jit(nb.float32[:,:](nb.float32[:,:], nb.int64, nb.int64, nb.float32[:]))
-def numba_optimised_nstep_value_function(values, batch_size, cutoff, gammas):
+def numba_optimised_nstep_value_function(values, batch_size, n_step, gammas):
     for i in range(batch_size):
-        for j in range(cutoff):
+        for j in range(n_step):
             values[i] += values[i + j + 1] * gammas[j]
     return values[:batch_size]
 
 
-@nb.jit(nb.void(nb.float32[:,:], nb.float32[:,:], nb.int64, nb.int64, nb.float32[:,:], nb.float32[:,:], nb.float32[:,:], nb.float32[:,:]))
-def numba_optimised_pred_rollover(old_predictions, predictions, vocab, index, seed, predicted_values, actions, fake_batch):
-    old_predictions[index] = predictions[0][0]
+@nb.jit(nb.void(nb.float32[:,:], nb.int64, nb.float32[:,:], nb.float32[:,:], nb.float32[:]))
+def numba_optimised_pred_rollover(predictions, index, seed, fake_batch, z_distrib):
+    seed[:, :-1] = seed[:, 1:]
+    seed[:, -1] = get_optimal_action(predictions, z_distrib)
+    fake_batch[index] = seed
 
-    choice = np.random.choice(vocab, 1, p=predictions[0][0])
-    predicted_values[index][0] = predictions[1][0]
-    actions[index][choice] = 1
+@nb.jit(nb.void(nb.float32[:,:], nb.int64, nb.float32[:,:], nb.float32[:,:], nb.float32[:], nb.float32[:,:], nb.int64))
+def numba_optimised_pred_rollover_with_actions(predictions, index, seed, fake_batch, z_distrib, actions, action):
+    if action != -1:
+        choice = action
+    else:
+        choice = get_optimal_action(predictions, z_distrib)
     seed[:, :-1] = seed[:, 1:]
     seed[:, -1] = choice
+    actions[index] = choice
     fake_batch[index] = seed
 
 @nb.jit(nb.void(nb.float32[:,:], nb.int64, nb.float32[:,:]))
-def numba_optimised_seed_switch(predictions, vocab, seed):
+def numba_optimised_seed_switch(predictions, seed, z_distrib):
     seed[:, :-1] = seed[:, 1:]
-    seed[:, -1] = np.random.choice(vocab, 1, p=predictions)
+    seed[:, -1] = get_optimal_action(predictions, z_distrib)
 
 
 if __name__ == '__main__':
-    agent = Agent(cutoff=6, from_save=False, batch_size=128)
+    agent = Agent(cutoff=5, from_save=False, batch_size=32)
     agent.train(epoch=5000)
