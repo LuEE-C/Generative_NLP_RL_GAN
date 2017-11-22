@@ -21,11 +21,13 @@ class Agent:
     def __init__(self, cutoff=8, from_save=False, gamma=.9, batch_size=32, min_history=64000, lr=0.0000625,
                  sigma_init=0.5, target_network_period=32000, adam_e=1.5*10e-4, atoms=51,
                  discriminator_loss_limits=0.1, n_steps=3):
+
         self.cutoff = cutoff
         self.environnement = Environnement(cutoff=cutoff, min_frequency_words=300000)
         self.vocab = self.environnement.different_words
 
         self.batch_size = batch_size
+
         self.n_steps = n_steps
 
         self.labels = np.array([1] * self.batch_size + [0] * self.batch_size)
@@ -39,6 +41,7 @@ class Agent:
 
         self.epsilon_greedy_max = 0.8
         self.sigma_init = sigma_init
+
 
         self.min_history = min_history
         self.lr = lr
@@ -141,6 +144,7 @@ class Agent:
                 for j in range(200):
                     memory.add((states[j], rewards[j], actions[j], states_prime[j]), 5)
 
+
             trained_frames = 1
             while np.mean(discrim_loss[-20:]) < 0.5 + 0.5 * 500000/(trained_frames * 10 * 4 * self.batch_size):
 
@@ -150,7 +154,6 @@ class Agent:
                 states, rewards, actions, states_prime = self.get_training_batch(10 * self.batch_size, self.get_epsilon(np.mean(discrim_loss[-20:])))
                 for j in range(10 * self.batch_size):
                     memory.add((states[j], rewards[j], actions[j], states_prime[j]), 5)
-
                 for j in range(10 * 4):
                     out, weights, indices = memory.select(min(1, 0.4 + 1.2 * np.mean(discrim_loss[-20:]))) # Scales b value
                     model_loss_array.append(self.train_on_replay(out, self.batch_size)[0])
@@ -198,7 +201,6 @@ class Agent:
 
     @nb.jit
     def make_seed(self, seed=None):
-
         if seed is None:
             # This is the kinda Z vector
             seed = np.random.random_integers(low=0, high=self.vocab - 1, size=(1, self.cutoff))
